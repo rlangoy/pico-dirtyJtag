@@ -208,11 +208,12 @@ void cdc_uart_task(void)
 			if ((rx_used_space >= FULL_SWO_PACKET) || ((rx_used_space != 0) && (uart->n_checks > 4)))
 			{
 				led_tx(1);
-				uart->n_checks = 0;
 				uint32_t capacity = tud_cdc_n_write_available(i);
-				uint32_t size_out = MIN(rx_used_space, capacity);
+				uint32_t contiguous = (uint32_t)(&uart->rx_buf[RX_BUFFER_SIZE] - uart->rx_read_address); // bytes to end of buffer
+				uint32_t size_out = MIN(MIN(rx_used_space, capacity), contiguous);
 				if (capacity >= FULL_SWO_PACKET)
 				{
+					uart->n_checks = 0;
 					uint32_t written = tud_cdc_n_write(i, uart->rx_read_address, size_out);
 					if (rx_used_space < FULL_SWO_PACKET)
 						tud_cdc_n_write_flush(i);
