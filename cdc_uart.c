@@ -152,7 +152,10 @@ void set_tx_dma(volatile uint8_t *l_tx_write_address, struct uart_device *uart)
 	}
 	if (ra != l_tx_write_address)
 	{
-		size_t length = (l_tx_write_address >= ra) ? (l_tx_write_address - ra) : (TX_BUFFER_SIZE - (ra - &uart->tx_buf[0]));
+		size_t total = (l_tx_write_address >= ra) ? (l_tx_write_address - ra) : (TX_BUFFER_SIZE - (ra - &uart->tx_buf[0]));
+		/* Clamp to contiguous region: DMA read is linear, so only go up to buffer end */
+		size_t to_end = (size_t)(&uart->tx_buf[TX_BUFFER_SIZE] - ra);
+		size_t length = MIN(total, to_end);
 		dma_channel_set_trans_count(uart->tx_dma_channel, length, true);
 	}
 }
@@ -160,26 +163,27 @@ void set_tx_dma(volatile uint8_t *l_tx_write_address, struct uart_device *uart)
 // shared between rx_dma_channel and tx_dma_channel
 static void dma_handler()
 {
-	volatile uint32_t ints = dma_hw->ints1;
 	struct uart_device *uart;
 
 	for (size_t i = 0; i < CDC_UART_INTF_COUNT; i++)
 	{
 		uart = &uart_devices[i];
-		
+
 		if (dma_channel_get_irq1_status(uart->rx_dma_channel))
 		{
+			// Ack immediately to avoid clearing a later interrupt
+			dma_hw->ints1 = 1u << uart->rx_dma_channel;
 			dma_channel_set_write_addr(uart->rx_dma_channel, &uart->rx_buf[0], true);
 		}
 		if (dma_channel_get_irq1_status(uart->tx_dma_channel))
 		{
+			// Ack immediately to avoid clearing a later interrupt
+			dma_hw->ints1 = 1u << uart->tx_dma_channel;
 			// cdc_uart_task can modify uart->tx_write_address. cache it locally
 			volatile uint8_t *l_tx_write_address = uart->tx_write_address;
-            set_tx_dma(l_tx_write_address, uart);
-        }
+			set_tx_dma(l_tx_write_address, uart);
+		}
 	}
-	
-	dma_hw->ints1 = ints;
 }
 
 
@@ -193,11 +197,10 @@ void cdc_uart_task(void)
 	{
 		uart = &uart_devices[i];
 		if (uart->cdc_stopped)
-			return;
+			continue;
 		if (tud_cdc_n_connected(i))
 		{
 			uart->is_connected = 1;
-			int written = 0;
 			volatile uint8_t *wa = (uint8_t*)(dma_channel_hw_addr(uart->rx_dma_channel)->write_addr);
 			if (wa == &uart->rx_buf[RX_BUFFER_SIZE])
 			{
@@ -208,12 +211,14 @@ void cdc_uart_task(void)
 			if ((rx_used_space >= FULL_SWO_PACKET) || ((rx_used_space != 0) && (uart->n_checks > 4)))
 			{
 				led_tx(1);
+				uart->n_checks = 0;
 				uint32_t capacity = tud_cdc_n_write_available(i);
-				uint32_t contiguous = (uint32_t)(&uart->rx_buf[RX_BUFFER_SIZE] - uart->rx_read_address); // bytes to end of buffer
-				uint32_t size_out = MIN(MIN(rx_used_space, capacity), contiguous);
+				/* Clamp to contiguous bytes before buffer wraps */
+				uint32_t rx_to_end = (uint32_t)(&uart->rx_buf[RX_BUFFER_SIZE] - uart->rx_read_address);
+				uint32_t rx_contiguous = MIN(rx_used_space, rx_to_end);
+				uint32_t size_out = MIN(rx_contiguous, capacity);
 				if (capacity >= FULL_SWO_PACKET)
 				{
-					uart->n_checks = 0;
 					uint32_t written = tud_cdc_n_write(i, uart->rx_read_address, size_out);
 					if (rx_used_space < FULL_SWO_PACKET)
 						tud_cdc_n_write_flush(i);
@@ -226,8 +231,10 @@ void cdc_uart_task(void)
 			}
 			uint usb_available = tud_cdc_n_available(i);
 			uint8_t *ra = (uint8_t *)(dma_channel_hw_addr(uart->tx_dma_channel)->read_addr);
-			uint32_t tx_free_space = (uart->tx_write_address >= ra) ? (&uart->tx_buf[TX_BUFFER_SIZE] - uart->tx_write_address) : (ra - uart->tx_write_address);
-			size_t watermark = MIN(usb_available, tx_free_space);
+			uint32_t tx_free_space = (uart->tx_write_address >= ra) ? (&uart->tx_buf[TX_BUFFER_SIZE] - uart->tx_write_address) : (ra - uart->tx_write_address - 1);
+			/* Clamp to contiguous space before buffer wraps */
+			uint32_t tx_to_end = (uint32_t)(&uart->tx_buf[TX_BUFFER_SIZE] - uart->tx_write_address);
+			size_t watermark = MIN(usb_available, MIN(tx_free_space, tx_to_end));
 			if (watermark > 0)
 			{
 				led_rx(1);
@@ -317,6 +324,18 @@ void tud_cdc_line_coding_cb(uint8_t itf, cdc_line_coding_t const* line_coding)
 			}
 
 			uart_set_format(uart->inst, data_bits, stop_bits, parity);
+			/* uart_deinit() resets the peripheral, re-enable FIFO and DMA DREQ signals */
+			uart_set_fifo_enabled(uart->inst, true);
+			uart_set_hw_flow(uart->inst, false, false);
+			hw_write_masked(&uart_get_hw(uart->inst)->dmacr,
+				(1 << UART_UARTDMACR_TXDMAE_LSB) | (1 << UART_UARTDMACR_RXDMAE_LSB),
+				UART_UARTDMACR_TXDMAE_BITS | UART_UARTDMACR_RXDMAE_BITS);
+			hw_clear_bits(&uart_get_hw(uart->inst)->rsr, UART_UARTRSR_BITS);
+			/* Reset buffer pointers to a known state */
+			uart->tx_write_address = &uart->tx_buf[0];
+			uart->rx_read_address = (uint8_t *)&uart->rx_buf[0];
+			dma_channel_set_read_addr(uart->tx_dma_channel, &uart->tx_buf[0], false);
+			dma_channel_set_write_addr(uart->rx_dma_channel, &uart->rx_buf[0], true);
 			uart->cdc_stopped = false;
 		}
 		}
